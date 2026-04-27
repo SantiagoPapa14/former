@@ -1,5 +1,4 @@
 mod model;
-
 use axum::{
     Json, Router,
     extract::{ConnectInfo, State},
@@ -8,7 +7,7 @@ use axum::{
     routing::{get, post},
 };
 use model::Submission;
-use sqlx::{Pool, Sqlite, sqlite::SqlitePool};
+use sqlx::{Pool, Postgres, postgres::PgPool};
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Instant};
 use tokio::{net::TcpListener, sync::Mutex};
 use tower_http::cors::{Any, CorsLayer};
@@ -17,28 +16,52 @@ type RateMap = Arc<Mutex<HashMap<String, (u32, Instant)>>>;
 
 #[tokio::main]
 async fn main() {
-    let pool = SqlitePool::connect("sqlite:db.sqlite")
+    let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL not set");
+    let pool = PgPool::connect(&database_url)
         .await
         .expect("Failed to connect to DB");
+
+    init_tables(&pool).await;
+
     let rate_map: RateMap = Arc::new(Mutex::new(HashMap::new()));
+
     let cors = CorsLayer::new()
         .allow_origin("https://semantic.com.ar".parse::<HeaderValue>().unwrap())
+        .allow_origin("https://ombufinanzas.com".parse::<HeaderValue>().unwrap())
         .allow_methods([Method::POST, Method::OPTIONS])
         .allow_headers(Any);
 
     let app = Router::new()
         .route("/semantic", post(create_message))
+        .route("/ombu", post(create_message))
         .route("/submissions", get(get_submissions))
         .layer(cors)
         .with_state((pool, rate_map))
         .into_make_service_with_connect_info::<SocketAddr>();
 
-    let listener = TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    let port = std::env::var("PORT").unwrap_or_else(|_| "3000".to_string());
+    let listener = TcpListener::bind(format!("0.0.0.0:{port}")).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }
 
+async fn init_tables(pool: &Pool<Postgres>) {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS submission (
+            id SERIAL PRIMARY KEY,
+            date TIMESTAMP,
+            page TEXT,
+            name TEXT,
+            email TEXT,
+            message TEXT
+        )",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
 async fn create_message(
-    State((pool, rate_map)): State<(Pool<Sqlite>, RateMap)>,
+    State((pool, rate_map)): State<(Pool<Postgres>, RateMap)>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(payload): Json<Submission>,
 ) -> impl IntoResponse {
@@ -46,6 +69,7 @@ async fn create_message(
     let entry = map
         .entry(addr.ip().to_string())
         .or_insert((0, Instant::now()));
+
     if entry.1.elapsed().as_secs() > 60 {
         *entry = (0, Instant::now());
     }
@@ -55,8 +79,9 @@ async fn create_message(
     }
     drop(map);
 
+    // PostgreSQL uses $1, $2, ... placeholders instead of ?1, ?2, ...
     sqlx::query(
-        "INSERT INTO submission (date, page, name, email, message) VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO submission (date, page, name, email, message) VALUES ($1, $2, $3, $4, $5)",
     )
     .bind(chrono::Utc::now().to_rfc3339())
     .bind("semantic")
@@ -71,13 +96,14 @@ async fn create_message(
 }
 
 async fn get_submissions(
-    State((pool, _)): State<(Pool<Sqlite>, RateMap)>,
+    State((pool, _)): State<(Pool<Postgres>, RateMap)>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> impl IntoResponse {
     if !addr.ip().is_loopback() && !matches!(addr.ip(), std::net::IpAddr::V4(ip) if ip.is_private())
     {
         return StatusCode::FORBIDDEN.into_response();
     }
+
     let rows = sqlx::query_as::<_, Submission>("SELECT * FROM submission")
         .fetch_all(&pool)
         .await
