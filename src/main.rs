@@ -1,11 +1,12 @@
 mod model;
 use axum::{
     Json, Router,
-    extract::{ConnectInfo, State},
-    http::{HeaderValue, Method, StatusCode},
+    extract::{ConnectInfo, Path, State},
+    http::{HeaderMap, HeaderValue, Method, StatusCode},
     response::IntoResponse,
     routing::{get, post},
 };
+use dotenvy::dotenv;
 use model::Submission;
 use sqlx::{Pool, Postgres, postgres::PgPool};
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Instant};
@@ -16,6 +17,7 @@ type RateMap = Arc<Mutex<HashMap<String, (u32, Instant)>>>;
 
 #[tokio::main]
 async fn main() {
+    dotenv().ok();
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL not set");
     let pool = PgPool::connect(&database_url)
         .await
@@ -32,8 +34,7 @@ async fn main() {
         .allow_headers(Any);
 
     let app = Router::new()
-        .route("/semantic", post(create_message))
-        .route("/ombu", post(create_message))
+        .route("/submit/:page", post(create_message))
         .route("/submissions", get(get_submissions))
         .layer(cors)
         .with_state((pool, rate_map))
@@ -63,6 +64,7 @@ async fn init_tables(pool: &Pool<Postgres>) {
 async fn create_message(
     State((pool, rate_map)): State<(Pool<Postgres>, RateMap)>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Path(page): Path<String>,
     Json(payload): Json<Submission>,
 ) -> impl IntoResponse {
     let mut map = rate_map.lock().await;
@@ -79,12 +81,11 @@ async fn create_message(
     }
     drop(map);
 
-    // PostgreSQL uses $1, $2, ... placeholders instead of ?1, ?2, ...
     sqlx::query(
         "INSERT INTO submission (date, page, name, email, message) VALUES ($1, $2, $3, $4, $5)",
     )
-    .bind(chrono::Utc::now().to_rfc3339())
-    .bind("semantic")
+    .bind(chrono::Utc::now().naive_utc())
+    .bind(page)
     .bind(payload.name)
     .bind(payload.email)
     .bind(payload.message)
@@ -97,11 +98,16 @@ async fn create_message(
 
 async fn get_submissions(
     State((pool, _)): State<(Pool<Postgres>, RateMap)>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
-    if !addr.ip().is_loopback() && !matches!(addr.ip(), std::net::IpAddr::V4(ip) if ip.is_private())
-    {
-        return StatusCode::FORBIDDEN.into_response();
+    let api_key = std::env::var("SUBMISSIONS_API_KEY").unwrap_or_default();
+    let provided = headers
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    if provided != api_key || api_key.is_empty() {
+        return StatusCode::UNAUTHORIZED.into_response();
     }
 
     let rows = sqlx::query_as::<_, Submission>("SELECT * FROM submission")
@@ -116,7 +122,7 @@ async fn get_submissions(
         |mut acc, r| {
             acc.push_str(&format!(
                 "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-                r.date.as_deref().unwrap_or(""),
+                r.date.map(|d| d.to_string()).as_deref().unwrap_or(""),
                 r.name,
                 r.email,
                 r.message
